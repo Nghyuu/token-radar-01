@@ -558,3 +558,502 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 export function dataScript(radar: RadarData): string {
   return `window.RADAR=${JSON.stringify(radar)};\n`;
 }
+
+// ---- radarExtra board analytics ----
+// Pure analyses over the scored board rows. They only read the rows the
+// program already writes, so they cannot change board.json, data.js or
+// the dossier. They give callers category, distribution, momentum and
+// risk views of the same board, plus one new composite metric. Every
+// function below is self-contained: it takes board rows in and returns
+// plain data out, with no I/O and no dependency on the scoring path.
+
+export interface RadarExtraModelBreakdown {
+  category_multiple: number;
+  growth_pct: number;
+  growth_multiplier: number;
+  maturity_multiplier: number;
+  breadth_multiplier: number;
+  age_days: number;
+}
+
+export interface RadarExtraBoardRow {
+  rank: number;
+  slug: string;
+  name: string;
+  category: string;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  gecko_id: string | null;
+  symbol: string | null;
+  token_status: string;
+  age_days: number;
+  implied_value_usd: number;
+  model: RadarExtraModelBreakdown;
+  farm_steps: string[];
+}
+
+export interface RadarExtraCategoryTotal {
+  category: string;
+  rows: number;
+  tvl_usd: number;
+  implied_value_usd: number;
+  median_implied_value_usd: number;
+  share_of_board: number;
+}
+
+export interface RadarExtraFlaggedRow {
+  slug: string;
+  name: string;
+  rank: number;
+  flags: string[];
+}
+
+export interface RadarExtraChainTotal {
+  chain: string;
+  rows: number;
+  implied_value_usd: number;
+  median_implied_value_usd: number;
+}
+
+export function radarExtraMedian(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+export function radarExtraMean(values: number[]): number {
+  if (values.length === 0) return 0;
+  let total = 0;
+  for (const v of values) total += v;
+  return total / values.length;
+}
+
+export function radarExtraSum(values: number[]): number {
+  let total = 0;
+  for (const v of values) total += v;
+  return total;
+}
+
+export function radarExtraQuantile(values: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const clamped = Math.min(1, Math.max(0, q));
+  const sorted = [...values].sort((a, b) => a - b);
+  const pos = clamped * (sorted.length - 1);
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+export function radarExtraClamp(value: number, lo: number, hi: number): number {
+  if (value < lo) return lo;
+  if (value > hi) return hi;
+  return value;
+}
+
+export function radarExtraRound(value: number, places: number): number {
+  const factor = Math.pow(10, places);
+  return Math.round(value * factor) / factor;
+}
+
+export function radarExtraCategoryTotals(rows: RadarExtraBoardRow[]): RadarExtraCategoryTotal[] {
+  const byCategory = new Map<string, RadarExtraBoardRow[]>();
+  for (const row of rows) {
+    const bucket = byCategory.get(row.category);
+    if (bucket === undefined) byCategory.set(row.category, [row]);
+    else bucket.push(row);
+  }
+  const boardTotal = radarExtraSum(rows.map((r) => r.implied_value_usd));
+  const totals: RadarExtraCategoryTotal[] = [];
+  for (const [category, members] of byCategory) {
+    const implied = radarExtraSum(members.map((m) => m.implied_value_usd));
+    totals.push({
+      category,
+      rows: members.length,
+      tvl_usd: radarExtraSum(members.map((m) => m.tvl_usd)),
+      implied_value_usd: implied,
+      median_implied_value_usd: radarExtraMedian(members.map((m) => m.implied_value_usd)),
+      share_of_board: boardTotal === 0 ? 0 : implied / boardTotal,
+    });
+  }
+  totals.sort((a, b) => b.implied_value_usd - a.implied_value_usd);
+  return totals;
+}
+
+export function radarExtraCategoryConcentration(rows: RadarExtraBoardRow[]): {
+  herfindahl: number;
+  top_category_share: number;
+  top_three_share: number;
+  effective_categories: number;
+  categories: number;
+} {
+  const totals = radarExtraCategoryTotals(rows);
+  const boardTotal = radarExtraSum(rows.map((r) => r.implied_value_usd));
+  if (totals.length === 0 || boardTotal === 0) {
+    return {
+      herfindahl: 0,
+      top_category_share: 0,
+      top_three_share: 0,
+      effective_categories: 0,
+      categories: 0,
+    };
+  }
+  let herfindahl = 0;
+  for (const t of totals) {
+    const share = t.implied_value_usd / boardTotal;
+    herfindahl += share * share;
+  }
+  const topThree = radarExtraSum(totals.slice(0, 3).map((t) => t.implied_value_usd));
+  return {
+    herfindahl: radarExtraRound(herfindahl, 4),
+    top_category_share: radarExtraRound(totals[0].share_of_board, 4),
+    top_three_share: radarExtraRound(topThree / boardTotal, 4),
+    effective_categories: radarExtraRound(1 / herfindahl, 2),
+    categories: totals.length,
+  };
+}
+
+export function radarExtraValueDeciles(rows: RadarExtraBoardRow[]): {
+  min: number;
+  deciles: number[];
+  median: number;
+  max: number;
+  top_decile_floor: number;
+} {
+  const values = rows.map((r) => r.implied_value_usd);
+  if (values.length === 0) {
+    return { min: 0, deciles: [], median: 0, max: 0, top_decile_floor: 0 };
+  }
+  const deciles: number[] = [];
+  for (let k = 1; k <= 9; k++) {
+    deciles.push(Math.round(radarExtraQuantile(values, k / 10)));
+  }
+  return {
+    min: Math.min(...values),
+    deciles,
+    median: Math.round(radarExtraMedian(values)),
+    max: Math.max(...values),
+    top_decile_floor: Math.round(radarExtraQuantile(values, 0.9)),
+  };
+}
+
+export function radarExtraGrowthBreakdown(rows: RadarExtraBoardRow[]): {
+  up: number;
+  flat: number;
+  down: number;
+  unknown: number;
+  median_change_7d: number;
+  mean_change_7d: number;
+  top_growers: string[];
+  top_fallers: string[];
+} {
+  let up = 0;
+  let flat = 0;
+  let down = 0;
+  let unknown = 0;
+  const changes: number[] = [];
+  for (const row of rows) {
+    if (row.change_7d === null || row.change_7d === undefined) {
+      unknown += 1;
+      continue;
+    }
+    changes.push(row.change_7d);
+    if (row.change_7d > 0.5) up += 1;
+    else if (row.change_7d < -0.5) down += 1;
+    else flat += 1;
+  }
+  const byChange = [...rows]
+    .filter((r) => r.change_7d !== null && r.change_7d !== undefined)
+    .sort((a, b) => (b.change_7d as number) - (a.change_7d as number));
+  const growers = byChange.slice(0, 5).map((r) => r.slug);
+  const fallers = byChange.slice(-5).reverse().map((r) => r.slug);
+  return {
+    up,
+    flat,
+    down,
+    unknown,
+    median_change_7d: radarExtraRound(radarExtraMedian(changes), 4),
+    mean_change_7d: radarExtraRound(radarExtraMean(changes), 4),
+    top_growers: growers,
+    top_fallers: fallers,
+  };
+}
+
+export function radarExtraBreadthBreakdown(rows: RadarExtraBoardRow[]): {
+  single_chain: number;
+  two_to_three: number;
+  four_to_six: number;
+  seven_to_ten: number;
+  eleven_plus: number;
+  median_chains: number;
+  max_chains: number;
+  top_chains: RadarExtraChainTotal[];
+} {
+  let single = 0;
+  let twoThree = 0;
+  let fourSix = 0;
+  let sevenTen = 0;
+  let elevenPlus = 0;
+  const counts: number[] = [];
+  const chainRows = new Map<string, RadarExtraBoardRow[]>();
+  for (const row of rows) {
+    const n = row.chains.length;
+    counts.push(n);
+    if (n <= 1) single += 1;
+    else if (n <= 3) twoThree += 1;
+    else if (n <= 6) fourSix += 1;
+    else if (n <= 10) sevenTen += 1;
+    else elevenPlus += 1;
+    for (const chain of row.chains) {
+      const bucket = chainRows.get(chain);
+      if (bucket === undefined) chainRows.set(chain, [row]);
+      else bucket.push(row);
+    }
+  }
+  const totals: RadarExtraChainTotal[] = [];
+  for (const [chain, members] of chainRows) {
+    totals.push({
+      chain,
+      rows: members.length,
+      implied_value_usd: radarExtraSum(members.map((m) => m.implied_value_usd)),
+      median_implied_value_usd: radarExtraMedian(members.map((m) => m.implied_value_usd)),
+    });
+  }
+  totals.sort((a, b) => b.rows - a.rows);
+  return {
+    single_chain: single,
+    two_to_three: twoThree,
+    four_to_six: fourSix,
+    seven_to_ten: sevenTen,
+    eleven_plus: elevenPlus,
+    median_chains: radarExtraMedian(counts),
+    max_chains: counts.length === 0 ? 0 : Math.max(...counts),
+    top_chains: totals.slice(0, 10),
+  };
+}
+
+export function radarExtraAgeBreakdown(rows: RadarExtraBoardRow[]): {
+  under_90d: number;
+  days_90_180: number;
+  days_181_365: number;
+  days_366_730: number;
+  over_730d: number;
+  median_age_days: number;
+  oldest_top_ten: string[];
+  youngest_top_ten: string[];
+} {
+  let under90 = 0;
+  let d90 = 0;
+  let d181 = 0;
+  let d366 = 0;
+  let over730 = 0;
+  const ages: number[] = [];
+  for (const row of rows) {
+    ages.push(row.age_days);
+    if (row.age_days < 90) under90 += 1;
+    else if (row.age_days <= 180) d90 += 1;
+    else if (row.age_days <= 365) d181 += 1;
+    else if (row.age_days <= 730) d366 += 1;
+    else over730 += 1;
+  }
+  const topTen = [...rows].sort((a, b) => b.implied_value_usd - a.implied_value_usd).slice(0, 10);
+  const oldest = [...topTen].sort((a, b) => b.age_days - a.age_days).map((r) => r.slug);
+  const youngest = [...topTen].sort((a, b) => a.age_days - b.age_days).map((r) => r.slug);
+  return {
+    under_90d: under90,
+    days_90_180: d90,
+    days_181_365: d181,
+    days_366_730: d366,
+    over_730d: over730,
+    median_age_days: radarExtraMedian(ages),
+    oldest_top_ten: oldest,
+    youngest_top_ten: youngest,
+  };
+}
+
+export function radarExtraWatchlistComparison(
+  rows: RadarExtraBoardRow[],
+  watchlistSlugs: string[],
+): {
+  watchlist_rows: number;
+  early_rows: number;
+  watchlist_median_implied: number;
+  early_median_implied: number;
+  watchlist_share_of_top_50: number;
+  watchlist_share_of_value: number;
+} {
+  const watch = new Set(watchlistSlugs);
+  const listed = rows.filter((r) => watch.has(r.slug));
+  const early = rows.filter((r) => !watch.has(r.slug));
+  const top50 = [...rows].sort((a, b) => b.implied_value_usd - a.implied_value_usd).slice(0, 50);
+  const listedTop50 = top50.filter((r) => watch.has(r.slug)).length;
+  const boardTotal = radarExtraSum(rows.map((r) => r.implied_value_usd));
+  const listedTotal = radarExtraSum(listed.map((r) => r.implied_value_usd));
+  return {
+    watchlist_rows: listed.length,
+    early_rows: early.length,
+    watchlist_median_implied: Math.round(radarExtraMedian(listed.map((r) => r.implied_value_usd))),
+    early_median_implied: Math.round(radarExtraMedian(early.map((r) => r.implied_value_usd))),
+    watchlist_share_of_top_50: top50.length === 0 ? 0 : listedTop50 / top50.length,
+    watchlist_share_of_value: boardTotal === 0 ? 0 : listedTotal / boardTotal,
+  };
+}
+
+export function radarExtraTopShare(rows: RadarExtraBoardRow[], n: number): {
+  top_n: number;
+  share_of_value: number;
+  top_slugs: string[];
+  cutoff_implied_value_usd: number;
+} {
+  const ordered = [...rows].sort((a, b) => b.implied_value_usd - a.implied_value_usd);
+  const top = ordered.slice(0, Math.max(0, n));
+  const boardTotal = radarExtraSum(rows.map((r) => r.implied_value_usd));
+  const topTotal = radarExtraSum(top.map((r) => r.implied_value_usd));
+  return {
+    top_n: top.length,
+    share_of_value: boardTotal === 0 ? 0 : radarExtraRound(topTotal / boardTotal, 4),
+    top_slugs: top.map((r) => r.slug),
+    cutoff_implied_value_usd: top.length === 0 ? 0 : top[top.length - 1].implied_value_usd,
+  };
+}
+
+export function radarExtraConvictionScore(row: RadarExtraBoardRow): number {
+  const growthPart = radarExtraClamp((row.model.growth_multiplier - 0.9) / 0.6, 0, 1) * 40;
+  const maturityPart = radarExtraClamp((row.model.maturity_multiplier - 0.5) / 0.5, 0, 1) * 30;
+  const breadthPart = radarExtraClamp((row.model.breadth_multiplier - 1) / 0.12, 0, 1) * 30;
+  return radarExtraRound(growthPart + maturityPart + breadthPart, 1);
+}
+
+export function radarExtraRiskFlags(rows: RadarExtraBoardRow[]): RadarExtraFlaggedRow[] {
+  if (rows.length === 0) return [];
+  const tvls = rows.map((r) => r.tvl_usd).sort((a, b) => a - b);
+  const topQuartileTvl = radarExtraQuantile(tvls, 0.75);
+  const implied = rows.map((r) => r.implied_value_usd);
+  const topDecileImplied = radarExtraQuantile(implied, 0.9);
+  const flagged: RadarExtraFlaggedRow[] = [];
+  for (const row of rows) {
+    const flags: string[] = [];
+    const change = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    if (change < 0 && row.tvl_usd >= topQuartileTvl) flags.push("cooling-giant");
+    if (row.chains.length <= 1 && row.implied_value_usd >= topDecileImplied) {
+      flags.push("single-chain-concentration");
+    }
+    if (row.age_days < 90 && row.implied_value_usd >= topDecileImplied) {
+      flags.push("young-heavyweight");
+    }
+    if (row.model.growth_pct <= -60 || row.model.growth_pct >= 150) {
+      flags.push("extreme-weekly-move");
+    }
+    if (row.model.category_multiple <= 0.05) flags.push("floor-multiple");
+    if (flags.length > 0) {
+      flagged.push({ slug: row.slug, name: row.name, rank: row.rank, flags });
+    }
+  }
+  flagged.sort((a, b) => a.rank - b.rank);
+  return flagged;
+}
+
+export function radarExtraChainCoverage(rows: RadarExtraBoardRow[]): RadarExtraChainTotal[] {
+  const chainRows = new Map<string, RadarExtraBoardRow[]>();
+  for (const row of rows) {
+    for (const chain of row.chains) {
+      const bucket = chainRows.get(chain);
+      if (bucket === undefined) chainRows.set(chain, [row]);
+      else bucket.push(row);
+    }
+  }
+  const totals: RadarExtraChainTotal[] = [];
+  for (const [chain, members] of chainRows) {
+    totals.push({
+      chain,
+      rows: members.length,
+      implied_value_usd: radarExtraSum(members.map((m) => m.implied_value_usd)),
+      median_implied_value_usd: Math.round(
+        radarExtraMedian(members.map((m) => m.implied_value_usd)),
+      ),
+    });
+  }
+  totals.sort((a, b) => b.implied_value_usd - a.implied_value_usd);
+  return totals;
+}
+
+export interface RadarExtraBoardReport {
+  rows: number;
+  total_implied_value_usd: number;
+  total_tvl_usd: number;
+  categories: RadarExtraCategoryTotal[];
+  concentration: ReturnType<typeof radarExtraCategoryConcentration>;
+  deciles: ReturnType<typeof radarExtraValueDeciles>;
+  growth: ReturnType<typeof radarExtraGrowthBreakdown>;
+  breadth: ReturnType<typeof radarExtraBreadthBreakdown>;
+  age: ReturnType<typeof radarExtraAgeBreakdown>;
+  top_10_share: number;
+  top_50_share: number;
+  watchlist: ReturnType<typeof radarExtraWatchlistComparison>;
+  flagged: RadarExtraFlaggedRow[];
+  chains: RadarExtraChainTotal[];
+}
+
+export function radarExtraBoardAnalytics(
+  rows: RadarExtraBoardRow[],
+  watchlistSlugs: string[],
+): RadarExtraBoardReport {
+  const ordered = [...rows].sort((a, b) => b.implied_value_usd - a.implied_value_usd);
+  const top10 = radarExtraTopShare(ordered, 10);
+  const top50 = radarExtraTopShare(ordered, 50);
+  const watchlist = radarExtraWatchlistComparison(rows, watchlistSlugs);
+  return {
+    rows: rows.length,
+    total_implied_value_usd: radarExtraSum(rows.map((r) => r.implied_value_usd)),
+    total_tvl_usd: radarExtraSum(rows.map((r) => r.tvl_usd)),
+    categories: radarExtraCategoryTotals(rows),
+    concentration: radarExtraCategoryConcentration(rows),
+    deciles: radarExtraValueDeciles(rows),
+    growth: radarExtraGrowthBreakdown(rows),
+    breadth: radarExtraBreadthBreakdown(rows),
+    age: radarExtraAgeBreakdown(rows),
+    top_10_share: top10.share_of_value,
+    top_50_share: top50.share_of_value,
+    watchlist,
+    flagged: radarExtraRiskFlags(rows),
+    chains: radarExtraChainCoverage(rows),
+  };
+}
+
+export function radarExtraAnalyticsText(report: RadarExtraBoardReport): string {
+  const lines: string[] = [];
+  lines.push("board rows: " + report.rows);
+  lines.push("total implied value: $" + report.total_implied_value_usd.toLocaleString("en-US"));
+  lines.push("total tvl: $" + report.total_tvl_usd.toLocaleString("en-US"));
+  lines.push("categories: " + report.categories.length);
+  if (report.categories.length > 0) {
+    const top = report.categories[0];
+    lines.push(
+      "top category: " + top.category + " (" + top.rows + " rows, " +
+        Math.round(top.share_of_board * 1000) / 10 + "% of value)",
+    );
+  }
+  lines.push("category herfindahl: " + report.concentration.herfindahl);
+  lines.push("median implied value: $" + report.deciles.median.toLocaleString("en-US"));
+  lines.push(
+    "growth up/flat/down: " + report.growth.up + "/" + report.growth.flat + "/" + report.growth.down,
+  );
+  lines.push("median chains per row: " + report.breadth.median_chains);
+  lines.push("median age days: " + report.age.median_age_days);
+  lines.push("top 10 share: " + Math.round(report.top_10_share * 1000) / 10 + "%");
+  lines.push("top 50 share: " + Math.round(report.top_50_share * 1000) / 10 + "%");
+  lines.push("watchlist rows: " + report.watchlist.watchlist_rows);
+  lines.push(
+    "watchlist share of top 50: " +
+      Math.round(report.watchlist.watchlist_share_of_top_50 * 1000) / 10 +
+      "%",
+  );
+  lines.push("flagged rows: " + report.flagged.length);
+  lines.push("chains covered: " + report.chains.length);
+  return lines.join("\n");
+}
